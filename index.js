@@ -15,6 +15,7 @@ const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_PAGE_IDS = [
   "34ae86878fe681499cc1dc8a63036574",
   "34ae86878fe6805b8a75dd819e812662",
+  "27ee86878fe6800fbd40fa044f862fb1",
 ];
 
 // ============================================================
