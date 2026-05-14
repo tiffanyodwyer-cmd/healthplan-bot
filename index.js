@@ -11,15 +11,17 @@ const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 
-// Your Notion page IDs (extracted from your URLs)
+// Regular Notion page IDs
 const NOTION_PAGE_IDS = [
   "34ae86878fe681499cc1dc8a63036574",
   "34ae86878fe6805b8a75dd819e812662",
   "27ee86878fe6800fbd40fa044f862fb1",
   "2afe86878fe6805685dcfe9630d46a63",
   "1cbe86878fe6807883f0f0bf5494c460",
-  "255e86878fe680e38636de4a7c818077",
 ];
+
+// Resource database ID (the table with Name, Permalink, Product, etc.)
+const RESOURCE_DATABASE_ID = "255e86878fe680e38636de4a7c818077";
 
 // ============================================================
 // MIDDLEWARE
@@ -35,7 +37,6 @@ function verifySlackRequest(req) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   const body = JSON.stringify(req.body);
 
-  // Reject requests older than 5 minutes
   const fiveMinutesAgo = Math.floor(Date.now() / 1000) - 60 * 5;
   if (parseInt(timestamp) < fiveMinutesAgo) return false;
 
@@ -54,11 +55,10 @@ function verifySlackRequest(req) {
 }
 
 // ============================================================
-// FETCH NOTION PAGE CONTENT
+// FETCH REGULAR NOTION PAGE CONTENT
 // ============================================================
 async function getNotionPageContent(pageId) {
   try {
-    // Get page blocks
     const response = await fetch(
       `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
       {
@@ -72,7 +72,6 @@ async function getNotionPageContent(pageId) {
     const data = await response.json();
     if (!data.results) return "";
 
-    // Extract text from blocks
     let content = "";
     for (const block of data.results) {
       const type = block.type;
@@ -83,7 +82,6 @@ async function getNotionPageContent(pageId) {
         if (text.trim()) content += text + "\n";
       }
 
-      // Handle child pages and toggle blocks recursively
       if (block.has_children) {
         const childContent = await getNotionPageContent(block.id);
         content += childContent;
@@ -98,22 +96,91 @@ async function getNotionPageContent(pageId) {
 }
 
 // ============================================================
-// ASK CLAUDE WITH NOTION CONTEXT
+// FETCH RESOURCE DATABASE (the table with permalinks)
+// ============================================================
+async function getResourceDatabase() {
+  try {
+    const response = await fetch(
+      `https://api.notion.com/v1/databases/${RESOURCE_DATABASE_ID}/query`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${NOTION_API_KEY}`,
+          "Notion-Version": "2022-06-28",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ page_size: 100 }),
+      }
+    );
+
+    const data = await response.json();
+    if (!data.results) return [];
+
+    // Extract Name, Description, Product, Audience, and Permalink from each row
+    return data.results.map((row) => {
+      const props = row.properties;
+
+      const name =
+        props.Name?.title?.map((t) => t.plain_text).join("") || "";
+      const description =
+        props.Description?.rich_text?.map((t) => t.plain_text).join("") || "";
+      const permalink =
+        props.Permalink?.url ||
+        props.Permalink?.rich_text?.map((t) => t.plain_text).join("") ||
+        "";
+      const product =
+        props.Product?.select?.name ||
+        props.Product?.multi_select?.map((s) => s.name).join(", ") ||
+        props.Product?.rich_text?.map((t) => t.plain_text).join("") ||
+        "";
+      const audience =
+        props.Audience?.select?.name ||
+        props.Audience?.multi_select?.map((s) => s.name).join(", ") ||
+        props.Audience?.rich_text?.map((t) => t.plain_text).join("") ||
+        "";
+      const contentType =
+        props["Content Type"]?.select?.name ||
+        props["Content Type"]?.rich_text?.map((t) => t.plain_text).join("") ||
+        "";
+
+      return { name, description, permalink, product, audience, contentType };
+    }).filter((row) => row.name);
+  } catch (err) {
+    console.error("Error fetching resource database:", err);
+    return [];
+  }
+}
+
+// ============================================================
+// ASK CLAUDE WITH NOTION CONTEXT + RESOURCE DATABASE
 // ============================================================
 async function askClaude(question) {
   try {
-    // Fetch all Notion pages
-    console.log("Fetching Notion pages...");
-    const pageContents = await Promise.all(
-      NOTION_PAGE_IDS.map((id) => getNotionPageContent(id))
-    );
+    console.log("Fetching Notion pages and resource database...");
+
+    // Fetch regular pages and resource database in parallel
+    const [pageContents, resources] = await Promise.all([
+      Promise.all(NOTION_PAGE_IDS.map((id) => getNotionPageContent(id))),
+      getResourceDatabase(),
+    ]);
+
     const notionContext = pageContents.join("\n\n---\n\n");
 
-    if (!notionContext.trim()) {
+    // Format resource database as readable text for Claude
+    const resourceContext =
+      resources.length > 0
+        ? resources
+            .map(
+              (r) =>
+                `Name: ${r.name}${r.product ? ` | Product: ${r.product}` : ""}${r.audience ? ` | Audience: ${r.audience}` : ""}${r.contentType ? ` | Type: ${r.contentType}` : ""}${r.description ? `\nDescription: ${r.description}` : ""}${r.permalink ? `\nPermalink: ${r.permalink}` : ""}`
+            )
+            .join("\n\n")
+        : "";
+
+    if (!notionContext.trim() && !resourceContext.trim()) {
       return "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support.";
     }
 
-    // Call Claude API
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -124,16 +191,25 @@ async function askClaude(question) {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 1024,
-        system: `You are a helpful health plan assistant for Vitable. You answer employee questions about their health plan benefits based ONLY on the provided Notion documentation below.
+        system: `You are a helpful health plan assistant for Vitable. You answer employee questions about their health plan benefits based ONLY on the provided documentation below.
+
+You have access to two types of content:
+1. FAQ and health plan documentation (for answering benefit questions)
+2. A resource library with permalinks (for when someone asks where to find a specific resource, one-pager, guide, or document)
+
+When someone asks where to find a resource (e.g. "where can I find a one-pager for VPC"), search the resource library and return the matching resource name and its permalink as a clickable link.
+
+When someone asks a health plan question, answer it from the FAQ documentation.
 
 Be friendly, clear, and concise. If the answer is not found in the documentation, respond with exactly: "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support."
 
 Do not make up or assume any information not explicitly stated in the documentation.
 
-Here is the health plan documentation:
----
+--- HEALTH PLAN FAQ DOCUMENTATION ---
 ${notionContext}
----`,
+
+--- RESOURCE LIBRARY (use for permalink lookups) ---
+${resourceContext}`,
         messages: [{ role: "user", content: question }],
       }),
     });
@@ -170,27 +246,20 @@ async function postToSlack(channel, text, threadTs) {
 // MAIN SLACK ENDPOINT
 // ============================================================
 app.post("/slack/events", async (req, res) => {
-  // Handle Slack's URL verification challenge
   if (req.body.type === "url_verification") {
     return res.json({ challenge: req.body.challenge });
   }
 
-  // Verify the request is from Slack
-  // (uncomment the lines below once everything is working)
   // if (!verifySlackRequest(req)) {
   //   return res.status(401).send("Unauthorized");
   // }
 
-  // Acknowledge Slack immediately (Slack requires a response within 3 seconds)
   res.status(200).send();
 
   const event = req.body.event;
   if (!event) return;
 
-  // Only respond to app mentions
   if (event.type !== "app_mention") return;
-
-  // Don't respond to bot messages
   if (event.bot_id) return;
 
   const question = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
@@ -198,17 +267,14 @@ app.post("/slack/events", async (req, res) => {
 
   console.log(`Question received: ${question}`);
 
-  // Post a "thinking" message so the user knows the bot is working
   await postToSlack(
     event.channel,
     "Let me check the health plan resources for you... :mag:",
     event.thread_ts || event.ts
   );
 
-  // Get the answer from Claude
   const answer = await askClaude(question);
 
-  // Post the answer back in the thread
   await postToSlack(
     event.channel,
     answer,
@@ -217,7 +283,7 @@ app.post("/slack/events", async (req, res) => {
 });
 
 // ============================================================
-// HEALTH CHECK (so Render knows the server is running)
+// HEALTH CHECK
 // ============================================================
 app.get("/", (req, res) => {
   res.send("Health Plan Bot is running!");
