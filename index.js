@@ -17,6 +17,7 @@ const NOTION_PAGE_IDS = [
   "34ae86878fe6805b8a75dd819e812662",
   "2afe86878fe6805685dcfe9630d46a63",
   "1cbe86878fe6807883f0f0bf5494c460",
+  "29ce86878fe6806a8c7aeb3323fbdc60",
 ];
 
 // Resource database ID (the table with Name, Permalink, Product, etc.)
