@@ -65,6 +65,7 @@ function verifySlackRequest(req) {
 // ============================================================
 async function getNotionPageContent(pageId) {
   try {
+    console.log(`Fetching Notion page: ${pageId}`);
     const response = await fetch(
       `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
       {
@@ -75,8 +76,20 @@ async function getNotionPageContent(pageId) {
       }
     );
 
+    console.log(`Notion page ${pageId} response status: ${response.status}`);
     const data = await response.json();
-    if (!data.results) return "";
+
+    if (data.status && data.status !== 200) {
+      console.error(`Notion API error for page ${pageId}:`, JSON.stringify(data));
+      return "";
+    }
+
+    if (!data.results) {
+      console.error(`No results for page ${pageId}:`, JSON.stringify(data));
+      return "";
+    }
+
+    console.log(`Page ${pageId} returned ${data.results.length} blocks`);
 
     let content = "";
     for (const block of data.results) {
@@ -94,9 +107,10 @@ async function getNotionPageContent(pageId) {
       }
     }
 
+    console.log(`Page ${pageId} extracted ${content.length} characters`);
     return content;
   } catch (err) {
-    console.error("Error fetching Notion page:", err);
+    console.error(`Error fetching Notion page ${pageId}:`, err.message);
     return "";
   }
 }
@@ -106,6 +120,7 @@ async function getNotionPageContent(pageId) {
 // ============================================================
 async function getResourceDatabase() {
   try {
+    console.log(`Fetching resource database: ${RESOURCE_DATABASE_ID}`);
     const response = await fetch(
       `https://api.notion.com/v1/databases/${RESOURCE_DATABASE_ID}/query`,
       {
@@ -119,8 +134,20 @@ async function getResourceDatabase() {
       }
     );
 
+    console.log(`Resource database response status: ${response.status}`);
     const data = await response.json();
-    if (!data.results) return [];
+
+    if (data.status && data.status !== 200) {
+      console.error(`Notion API error for resource database:`, JSON.stringify(data));
+      return [];
+    }
+
+    if (!data.results) {
+      console.error(`No results for resource database:`, JSON.stringify(data));
+      return [];
+    }
+
+    console.log(`Resource database returned ${data.results.length} rows`);
 
     return data.results.map((row) => {
       const props = row.properties;
@@ -151,7 +178,7 @@ async function getResourceDatabase() {
       return { name, description, permalink, product, audience, contentType };
     }).filter((row) => row.name);
   } catch (err) {
-    console.error("Error fetching resource database:", err);
+    console.error(`Error fetching resource database:`, err.message);
     return [];
   }
 }
@@ -161,14 +188,17 @@ async function getResourceDatabase() {
 // ============================================================
 async function askClaude(question) {
   try {
-    console.log("Fetching Notion pages and resource database...");
+    console.log("Starting Notion fetch...");
 
     const [pageContents, resources] = await Promise.all([
       Promise.all(NOTION_PAGE_IDS.map((id) => getNotionPageContent(id))),
       getResourceDatabase(),
     ]);
 
+    console.log(`All Notion pages fetched. Resource rows: ${resources.length}`);
+
     const notionContext = pageContents.join("\n\n---\n\n");
+    console.log(`Total Notion context length: ${notionContext.length} characters`);
 
     const resourceContext =
       resources.length > 0
@@ -181,9 +211,11 @@ async function askClaude(question) {
         : "";
 
     if (!notionContext.trim() && !resourceContext.trim()) {
+      console.log("No content found in Notion pages or resource database");
       return "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support.";
     }
 
+    console.log("Calling Claude API...");
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -217,13 +249,21 @@ ${resourceContext}`,
       }),
     });
 
+    console.log(`Claude API response status: ${response.status}`);
     const data = await response.json();
+
+    if (data.error) {
+      console.error("Claude API error:", JSON.stringify(data.error));
+      return "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support.";
+    }
+
+    console.log("Claude responded successfully");
     return (
       data.content?.[0]?.text ||
       "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support."
     );
   } catch (err) {
-    console.error("Error calling Claude:", err);
+    console.error("Error in askClaude:", err.message);
     return "I'm unable to find this information in the current Health Plan resources. Please ask your question in #ask-healthplan so the team can provide additional support.";
   }
 }
@@ -277,7 +317,7 @@ async function saveQAToNotion(question, answer, threadLink, date) {
     });
     console.log(`Saved Q&A to Notion: ${question.substring(0, 50)}...`);
   } catch (err) {
-    console.error("Error saving Q&A to Notion:", err);
+    console.error("Error saving Q&A to Notion:", err.message);
   }
 }
 
@@ -295,7 +335,7 @@ async function getThreadReplies(channelId, threadTs) {
     const data = await response.json();
     return data.messages || [];
   } catch (err) {
-    console.error("Error fetching thread replies:", err);
+    console.error("Error fetching thread replies:", err.message);
     return [];
   }
 }
@@ -315,7 +355,7 @@ async function hasCheckmarkReaction(channelId, messageTs) {
     const reactions = data.message?.reactions || [];
     return reactions.some((r) => r.name === "white_check_mark");
   } catch (err) {
-    console.error("Error fetching reactions:", err);
+    console.error("Error fetching reactions:", err.message);
     return false;
   }
 }
@@ -342,7 +382,6 @@ async function runDailyQASync() {
       return;
     }
 
-    // Only look at messages from the Linear Asks bot
     const linearMessages = data.messages.filter(
       (msg) => msg.subtype === "bot_message" && msg.bot_profile?.name === "Linear Asks"
     );
@@ -350,18 +389,14 @@ async function runDailyQASync() {
     console.log(`Found ${linearMessages.length} Linear Asks messages to check`);
 
     for (const msg of linearMessages) {
-      // Check if the original message has a ✅ reaction
       const isAnswered = await hasCheckmarkReaction(ASK_HEALTHPLAN_CHANNEL_ID, msg.ts);
       if (!isAnswered) continue;
 
-      // Get the thread replies to find the answer
       const replies = await getThreadReplies(ASK_HEALTHPLAN_CHANNEL_ID, msg.ts);
       if (replies.length < 2) continue;
 
-      // The question comes from the Linear Asks message text or attachment title
       const question = msg.text || msg.attachments?.[0]?.title || "Unknown question";
 
-      // Combine all human replies as the answer
       const answerReplies = replies
         .slice(1)
         .filter((r) => !r.bot_id)
@@ -370,17 +405,14 @@ async function runDailyQASync() {
 
       if (!answerReplies) continue;
 
-      // Build a link to the Slack thread
       const threadLink = `https://vitable.slack.com/archives/${ASK_HEALTHPLAN_CHANNEL_ID}/p${msg.ts.replace(".", "")}`;
-
-      // Save to Notion
       const date = new Date(parseFloat(msg.ts) * 1000).toISOString().split("T")[0];
       await saveQAToNotion(question, answerReplies, threadLink, date);
     }
 
     console.log("Daily Q&A sync complete!");
   } catch (err) {
-    console.error("Error during daily Q&A sync:", err);
+    console.error("Error during daily Q&A sync:", err.message);
   }
 }
 
@@ -390,11 +422,9 @@ async function runDailyQASync() {
 function scheduleDailySync() {
   const now = new Date();
 
-  // 3pm PST = 11pm UTC (UTC-8 standard time)
   const nextRun = new Date();
   nextRun.setUTCHours(23, 0, 0, 0);
 
-  // If 11pm UTC has already passed today, schedule for tomorrow
   if (nextRun <= now) {
     nextRun.setUTCDate(nextRun.getUTCDate() + 1);
   }
@@ -404,7 +434,6 @@ function scheduleDailySync() {
 
   setTimeout(() => {
     runDailyQASync();
-    // After first run, repeat every 24 hours
     setInterval(runDailyQASync, 24 * 60 * 60 * 1000);
   }, msUntilNextRun);
 }
